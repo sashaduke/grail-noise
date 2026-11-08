@@ -1,0 +1,763 @@
+module noise;
+use noise_tables;
+
+// Coherent noise: a port of FastNoiseLite 1.1.1 (https://github.com/Auburn/FastNoiseLite, MIT,
+// Copyright (c) 2023 Jordan Peck, Copyright (c) 2023 Contributors) for the configurations
+// Abundance uses: 2D OpenSimplex2, OpenSimplex2S, Cellular, Perlin and Value noise with the None,
+// FBm and Ridged fractals, 2D OpenSimplex2 domain warp (single and progressive), and 3D
+// OpenSimplex2S with the None and FBm fractals (default rotation). Other 3D noise types return 0.
+//
+// Coordinates are f64 and every other quantity is f32, as in the reference instantiated with
+// double coordinates; f32 arithmetic rounds after each operation like C float, so results match
+// the C++ bit for bit (tests/reference/noise). Hashing is 32-bit two's-complement arithmetic,
+// computed in i64 and wrapped explicitly.
+
+pub const NOISE_OPENSIMPLEX2: u64 = 0;
+pub const NOISE_OPENSIMPLEX2S: u64 = 1;
+pub const NOISE_CELLULAR: u64 = 2;
+pub const NOISE_PERLIN: u64 = 3;
+pub const NOISE_VALUE: u64 = 5;
+pub const FRACTAL_NONE: u64 = 0;
+pub const FRACTAL_FBM: u64 = 1;
+pub const FRACTAL_RIDGED: u64 = 2;
+pub const FRACTAL_WARP_PROGRESSIVE: u64 = 4;
+pub const CELL_EUCLIDEAN: u64 = 0;
+pub const CELL_EUCLIDEAN_SQ: u64 = 1;
+pub const CELL_MANHATTAN: u64 = 2;
+pub const CELL_HYBRID: u64 = 3;
+pub const CELL_VALUE: u64 = 0;
+pub const CELL_DISTANCE: u64 = 1;
+pub const CELL_DISTANCE2: u64 = 2;
+pub const CELL_DISTANCE2_ADD: u64 = 3;
+pub const CELL_DISTANCE2_SUB: u64 = 4;
+pub const CELL_DISTANCE2_MUL: u64 = 5;
+pub const CELL_DISTANCE2_DIV: u64 = 6;
+
+const PRIME_X: i64 = 501125321;
+const PRIME_Y: i64 = 1136930381;
+const PRIME_Z: i64 = 1720413743;
+
+pub struct Noise {
+    seed: i64,
+    frequency: f32,
+    noise_type: u64,
+    fractal_type: u64,
+    octaves: u64,
+    lacunarity: f32,
+    gain: f32,
+    weighted_strength: f32,
+    bounding: f32,
+    cell_distance: u64,
+    cell_return: u64,
+    cell_jitter: f32,
+    warp_amp: f32,
+    grad: f32[],
+    rand: f32[],
+    grad3: f32[]
+}
+
+// A generator with FastNoiseLite's defaults (seed 1337, frequency 0.01, OpenSimplex2, no fractal).
+pub fn new(seed: i64) -> Noise {
+    return Noise {
+        seed: seed, frequency: f32(0.01), noise_type: NOISE_OPENSIMPLEX2, fractal_type: FRACTAL_NONE,
+        octaves: 3, lacunarity: f32(2.0), gain: f32(0.5), weighted_strength: f32(0.0),
+        bounding: noise_tables::default_bounding(), cell_distance: CELL_EUCLIDEAN_SQ,
+        cell_return: CELL_DISTANCE, cell_jitter: f32(1.0), warp_amp: f32(1.0),
+        grad: noise_tables::gradients_2d(), rand: noise_tables::rand_vecs_2d(),
+        grad3: noise_tables::gradients_3d()
+    };
+}
+pub fn set_frequency<a>(n: (&a mut Noise), frequency: f32) {
+    n.frequency = frequency;
+}
+pub fn set_noise_type<a>(n: (&a mut Noise), kind: u64) {
+    n.noise_type = kind;
+}
+pub fn set_fractal_type<a>(n: (&a mut Noise), kind: u64) {
+    n.fractal_type = kind;
+}
+pub fn set_fractal_octaves<a>(n: (&a mut Noise), octaves: u64) {
+    n.octaves = octaves;
+    bound(&mut n);
+}
+pub fn set_fractal_lacunarity<a>(n: (&a mut Noise), lacunarity: f32) {
+    n.lacunarity = lacunarity;
+}
+pub fn set_fractal_gain<a>(n: (&a mut Noise), gain: f32) {
+    n.gain = gain;
+    bound(&mut n);
+}
+pub fn set_fractal_weighted_strength<a>(n: (&a mut Noise), strength: f32) {
+    n.weighted_strength = strength;
+}
+pub fn set_cellular_distance<a>(n: (&a mut Noise), kind: u64) {
+    n.cell_distance = kind;
+}
+pub fn set_cellular_return<a>(n: (&a mut Noise), kind: u64) {
+    n.cell_return = kind;
+}
+pub fn set_cellular_jitter<a>(n: (&a mut Noise), jitter: f32) {
+    n.cell_jitter = jitter;
+}
+pub fn set_domain_warp_amp<a>(n: (&a mut Noise), amp: f32) {
+    n.warp_amp = amp;
+}
+
+fn fabs(f: f32) -> f32 {
+    if f < f32(0.0) {
+        return f32(0.0) - f;
+    }
+    return f;
+}
+fn fmin(a: f32, b: f32) -> f32 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+fn fmax(a: f32, b: f32) -> f32 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    return a + t * (b - a);
+}
+fn hermite(t: f32) -> f32 {
+    return t * t * (f32(3.0) - f32(2.0) * t);
+}
+fn quintic(t: f32) -> f32 {
+    return t * t * t * (t * (t * f32(6.0) - f32(15.0)) + f32(10.0));
+}
+fn bound<a>(n: (&a mut Noise)) {
+    gain := fabs(n.gain);
+    mut amp = gain;
+    mut fractal = f32(1.0);
+    mut i = 1;
+    while i < n.octaves {
+        fractal = fractal + amp;
+        amp = amp * gain;
+        i += 1;
+    }
+    n.bounding = f32(1.0) / fractal;
+}
+
+// 32-bit two's-complement wrap of an i64.
+fn w32(v: i64) -> i64 {
+    u := v & 4294967295;
+    if u >= 2147483648 {
+        return u - 4294967296;
+    }
+    return u;
+}
+fn floor_i(f: f64) -> i64 {
+    if f >= 0.0 {
+        return i64(f);
+    }
+    return i64(f) - 1;
+}
+fn round_i(f: f64) -> i64 {
+    if f >= 0.0 {
+        return i64(f + 0.5);
+    }
+    return i64(f - 0.5);
+}
+fn hash(seed: i64, xp: i64, yp: i64) -> i64 {
+    return w32((seed ^ xp ^ yp) * 668265261);
+}
+fn val_coord(seed: i64, xp: i64, yp: i64) -> f32 {
+    mut h = hash(seed, xp, yp);
+    h = w32(h * h);
+    h = h ^ w32(h << 19);
+    return f32(f64(h)) * noise_tables::inv_2_31();
+}
+fn grad_coord<a>(n: (&a Noise), seed: i64, xp: i64, yp: i64, xd: f32, yd: f32) -> f32 {
+    mut h = hash(seed, xp, yp);
+    h = h ^ (h >> 15);
+    index := u64(h & 254);
+    return xd * n.grad[index] + yd * n.grad[index | 1];
+}
+
+// ---- single noise ----
+fn single<a>(n: (&a Noise), seed: i64, x: f64, y: f64) -> f32 {
+    if n.noise_type == NOISE_OPENSIMPLEX2 {
+        return simplex(&n, seed, x, y);
+    }
+    if n.noise_type == NOISE_OPENSIMPLEX2S {
+        return simplex_s(&n, seed, x, y);
+    }
+    if n.noise_type == NOISE_CELLULAR {
+        return cellular(&n, seed, x, y);
+    }
+    if n.noise_type == NOISE_PERLIN {
+        return perlin(&n, seed, x, y);
+    }
+    if n.noise_type == NOISE_VALUE {
+        return value(seed, x, y);
+    }
+    return f32(0.0);
+}
+
+fn value(seed: i64, x: f64, y: f64) -> f32 {
+    mut x0 = floor_i(x);
+    mut y0 = floor_i(y);
+    xs := hermite(f32(x - f64(x0)));
+    ys := hermite(f32(y - f64(y0)));
+    x0 = w32(x0 * PRIME_X);
+    y0 = w32(y0 * PRIME_Y);
+    x1 := w32(x0 + PRIME_X);
+    y1 := w32(y0 + PRIME_Y);
+    xf0 := lerp(val_coord(seed, x0, y0), val_coord(seed, x1, y0), xs);
+    xf1 := lerp(val_coord(seed, x0, y1), val_coord(seed, x1, y1), xs);
+    return lerp(xf0, xf1, ys);
+}
+
+fn perlin<a>(n: (&a Noise), seed: i64, x: f64, y: f64) -> f32 {
+    mut x0 = floor_i(x);
+    mut y0 = floor_i(y);
+    xd0 := f32(x - f64(x0));
+    yd0 := f32(y - f64(y0));
+    xd1 := xd0 - f32(1.0);
+    yd1 := yd0 - f32(1.0);
+    xs := quintic(xd0);
+    ys := quintic(yd0);
+    x0 = w32(x0 * PRIME_X);
+    y0 = w32(y0 * PRIME_Y);
+    x1 := w32(x0 + PRIME_X);
+    y1 := w32(y0 + PRIME_Y);
+    xf0 := lerp(grad_coord(&n, seed, x0, y0, xd0, yd0), grad_coord(&n, seed, x1, y0, xd1, yd0), xs);
+    xf1 := lerp(grad_coord(&n, seed, x0, y1, xd0, yd1), grad_coord(&n, seed, x1, y1, xd1, yd1), xs);
+    return lerp(xf0, xf1, ys) * noise_tables::perlin_scale();
+}
+
+fn simplex<a>(n: (&a Noise), seed: i64, x: f64, y: f64) -> f32 {
+    g2 := noise_tables::os2_g2();
+    mut i = floor_i(x);
+    mut j = floor_i(y);
+    xi := f32(x - f64(i));
+    yi := f32(y - f64(j));
+    t := (xi + yi) * g2;
+    x0 := xi - t;
+    y0 := yi - t;
+    i = w32(i * PRIME_X);
+    j = w32(j * PRIME_Y);
+    mut n0 = f32(0.0);
+    mut n1 = f32(0.0);
+    mut n2 = f32(0.0);
+    a := f32(0.5) - x0 * x0 - y0 * y0;
+    if a > f32(0.0) {
+        n0 = (a * a) * (a * a) * grad_coord(&n, seed, i, j, x0, y0);
+    }
+    c := noise_tables::os2_c1() * t + (noise_tables::os2_c2() + a);
+    if c > f32(0.0) {
+        x2 := x0 + noise_tables::os2_x2();
+        y2 := y0 + noise_tables::os2_x2();
+        n2 = (c * c) * (c * c) * grad_coord(&n, seed, w32(i + PRIME_X), w32(j + PRIME_Y), x2, y2);
+    }
+    if y0 > x0 {
+        x1 := x0 + g2;
+        y1 := y0 + noise_tables::os2_g2m1();
+        b := f32(0.5) - x1 * x1 - y1 * y1;
+        if b > f32(0.0) {
+            n1 = (b * b) * (b * b) * grad_coord(&n, seed, i, w32(j + PRIME_Y), x1, y1);
+        }
+    } else {
+        x1 := x0 + noise_tables::os2_g2m1();
+        y1 := y0 + g2;
+        b := f32(0.5) - x1 * x1 - y1 * y1;
+        if b > f32(0.0) {
+            n1 = (b * b) * (b * b) * grad_coord(&n, seed, w32(i + PRIME_X), j, x1, y1);
+        }
+    }
+    return (n0 + n1 + n2) * noise_tables::os2_scale();
+}
+
+// One OpenSimplex2S contribution: (2/3 - x^2 - y^2)^4 * gradient, or 0 outside the kernel.
+fn s_term<a>(n: (&a Noise), seed: i64, xp: i64, yp: i64, xd: f32, yd: f32) -> f32 {
+    a := noise_tables::two_thirds() - xd * xd - yd * yd;
+    if a > f32(0.0) {
+        return (a * a) * (a * a) * grad_coord(&n, seed, xp, yp, xd, yd);
+    }
+    return f32(0.0);
+}
+
+fn simplex_s<a>(n: (&a Noise), seed: i64, x: f64, y: f64) -> f32 {
+    g2d := (3.0 - 1.7320508075688772) / 6.0;
+    g2 := noise_tables::os2s_g2();
+    mut i = floor_i(x);
+    mut j = floor_i(y);
+    xi := f32(x - f64(i));
+    yi := f32(y - f64(j));
+    i = w32(i * PRIME_X);
+    j = w32(j * PRIME_Y);
+    i1 := w32(i + PRIME_X);
+    j1 := w32(j + PRIME_Y);
+    t := (xi + yi) * g2;
+    x0 := xi - t;
+    y0 := yi - t;
+    a0 := noise_tables::two_thirds() - x0 * x0 - y0 * y0;
+    mut value = (a0 * a0) * (a0 * a0) * grad_coord(&n, seed, i, j, x0, y0);
+    a1 := noise_tables::os2s_c1() * t + (noise_tables::os2s_c2() + a0);
+    x1 := x0 - noise_tables::os2s_1m2g2();
+    y1 := y0 - noise_tables::os2s_1m2g2();
+    value = value + (a1 * a1) * (a1 * a1) * grad_coord(&n, seed, i1, j1, x1, y1);
+    xmyi := xi - yi;
+    if f64(t) > g2d {
+        if xi + xmyi > f32(1.0) {
+            value = value + s_term(&n, seed, w32(i + (PRIME_X << 1)), w32(j + PRIME_Y),
+                x0 + noise_tables::os2s_3g2m2(), y0 + noise_tables::os2s_3g2m1());
+        } else {
+            value = value + s_term(&n, seed, i, w32(j + PRIME_Y), x0 + g2, y0 + noise_tables::os2s_g2m1());
+        }
+        if yi - xmyi > f32(1.0) {
+            value = value + s_term(&n, seed, w32(i + PRIME_X), w32(j + (PRIME_Y << 1)),
+                x0 + noise_tables::os2s_3g2m1(), y0 + noise_tables::os2s_3g2m2());
+        } else {
+            value = value + s_term(&n, seed, w32(i + PRIME_X), j, x0 + noise_tables::os2s_g2m1(), y0 + g2);
+        }
+    } else {
+        if xi + xmyi < f32(0.0) {
+            value = value + s_term(&n, seed, w32(i - PRIME_X), j, x0 + noise_tables::os2s_1mg2(), y0 - g2);
+        } else {
+            value = value + s_term(&n, seed, w32(i + PRIME_X), j, x0 + noise_tables::os2s_g2m1(), y0 + g2);
+        }
+        if yi < xmyi {
+            value = value + s_term(&n, seed, i, w32(j - PRIME_Y), x0 - g2, y0 - noise_tables::os2s_g2m1());
+        } else {
+            value = value + s_term(&n, seed, i, w32(j + PRIME_Y), x0 + g2, y0 + noise_tables::os2s_g2m1());
+        }
+    }
+    return value * noise_tables::os2s_scale();
+}
+
+fn cellular<a>(n: (&a Noise), seed: i64, x: f64, y: f64) -> f32 {
+    xr := round_i(x);
+    yr := round_i(y);
+    mut d0 = noise_tables::cell_far();
+    mut d1 = noise_tables::cell_far();
+    mut closest: i64 = 0;
+    jitter := noise_tables::cell_jitter() * n.cell_jitter;
+    mut xp = w32((xr - 1) * PRIME_X);
+    yp_base := w32((yr - 1) * PRIME_Y);
+    mut xi = xr - 1;
+    while xi <= xr + 1 {
+        mut yp = yp_base;
+        mut yi = yr - 1;
+        while yi <= yr + 1 {
+            h := hash(seed, xp, yp);
+            idx := u64(h & 510);
+            vx := f32(f64(xi) - x) + n.rand[idx] * jitter;
+            vy := f32(f64(yi) - y) + n.rand[idx | 1] * jitter;
+            mut d = vx * vx + vy * vy;
+            if n.cell_distance == CELL_MANHATTAN {
+                d = fabs(vx) + fabs(vy);
+            }
+            if n.cell_distance == CELL_HYBRID {
+                d = (fabs(vx) + fabs(vy)) + (vx * vx + vy * vy);
+            }
+            d1 = fmax(fmin(d1, d), d0);
+            if d < d0 {
+                d0 = d;
+                closest = h;
+            }
+            yp = w32(yp + PRIME_Y);
+            yi += 1;
+        }
+        xp = w32(xp + PRIME_X);
+        xi += 1;
+    }
+    if (n.cell_distance == CELL_EUCLIDEAN) && (n.cell_return >= CELL_DISTANCE) {
+        d0 = f32(f64(d0).sqrt());
+        if n.cell_return >= CELL_DISTANCE2 {
+            d1 = f32(f64(d1).sqrt());
+        }
+    }
+    one := f32(1.0);
+    r := n.cell_return;
+    if r == CELL_VALUE {
+        return f32(f64(closest)) * noise_tables::inv_2_31();
+    }
+    if r == CELL_DISTANCE {
+        return d0 - one;
+    }
+    if r == CELL_DISTANCE2 {
+        return d1 - one;
+    }
+    if r == CELL_DISTANCE2_ADD {
+        return (d1 + d0) * f32(0.5) - one;
+    }
+    if r == CELL_DISTANCE2_SUB {
+        return d1 - d0 - one;
+    }
+    if r == CELL_DISTANCE2_MUL {
+        return d1 * d0 * f32(0.5) - one;
+    }
+    if r == CELL_DISTANCE2_DIV {
+        return d0 / d1 - one;
+    }
+    return f32(0.0);
+}
+
+// ---- fractals and the public sampler ----
+pub fn get<a>(n: (&a Noise), x_in: f64, y_in: f64) -> f32 {
+    mut x = x_in * f64(n.frequency);
+    mut y = y_in * f64(n.frequency);
+    if (n.noise_type == NOISE_OPENSIMPLEX2) || (n.noise_type == NOISE_OPENSIMPLEX2S) {
+        f2 := 0.5 * (1.7320508075688772 - 1.0);
+        t := (x + y) * f2;
+        x = x + t;
+        y = y + t;
+    }
+    if n.fractal_type == FRACTAL_FBM {
+        return fbm(&n, x, y);
+    }
+    if n.fractal_type == FRACTAL_RIDGED {
+        return ridged(&n, x, y);
+    }
+    return single(&n, n.seed, x, y);
+}
+
+fn fbm<a>(n: (&a Noise), x_in: f64, y_in: f64) -> f32 {
+    mut x = x_in;
+    mut y = y_in;
+    mut seed = n.seed;
+    mut sum = f32(0.0);
+    mut amp = n.bounding;
+    for i in n.octaves {
+        v := single(&n, seed, x, y);
+        seed = w32(seed + 1);
+        sum = sum + v * amp;
+        amp = amp * lerp(f32(1.0), fmin(v + f32(1.0), f32(2.0)) * f32(0.5), n.weighted_strength);
+        x = x * f64(n.lacunarity);
+        y = y * f64(n.lacunarity);
+        amp = amp * n.gain;
+    }
+    return sum;
+}
+
+fn ridged<a>(n: (&a Noise), x_in: f64, y_in: f64) -> f32 {
+    mut x = x_in;
+    mut y = y_in;
+    mut seed = n.seed;
+    mut sum = f32(0.0);
+    mut amp = n.bounding;
+    for i in n.octaves {
+        v := fabs(single(&n, seed, x, y));
+        seed = w32(seed + 1);
+        sum = sum + (v * f32(-2.0) + f32(1.0)) * amp;
+        amp = amp * lerp(f32(1.0), f32(1.0) - v, n.weighted_strength);
+        x = x * f64(n.lacunarity);
+        y = y * f64(n.lacunarity);
+        amp = amp * n.gain;
+    }
+    return sum;
+}
+
+// ---- 2D OpenSimplex2 domain warp ----
+pub struct Point {
+    x: f64,
+    y: f64
+}
+
+// Warps a point (FastNoiseLite DomainWarp with DomainWarpType_OpenSimplex2): FRACTAL_NONE is a
+// single warp, FRACTAL_WARP_PROGRESSIVE applies `octaves` warps, each to the warped point.
+pub fn warp<a>(n: (&a Noise), p: Point) -> Point {
+    mut out = p;
+    mut seed = n.seed;
+    mut amp = n.warp_amp * n.bounding;
+    mut freq = n.frequency;
+    mut rounds = 1;
+    if n.fractal_type == FRACTAL_WARP_PROGRESSIVE {
+        rounds = n.octaves;
+    }
+    for r in rounds {
+        f2 := 0.5 * (1.7320508075688772 - 1.0);
+        t := (out.x + out.y) * f2;
+        s := Point { x: out.x + t, y: out.y + t };
+        out = warp_simplex(&n, seed, amp * noise_tables::warp_os2_amp(), freq, s, out);
+        seed = w32(seed + 1);
+        amp = amp * n.gain;
+        freq = freq * n.lacunarity;
+    }
+    return out;
+}
+
+fn grad_dual<a>(n: (&a Noise), seed: i64, xp: i64, yp: i64, xd: f32, yd: f32) -> Point {
+    h := hash(seed, xp, yp);
+    i1 := u64(h & 254);
+    i2 := u64((h >> 7) & 510);
+    v := xd * n.grad[i1] + yd * n.grad[i1 | 1];
+    // Point carries the two f32 outputs widened (exactly) to f64.
+    return Point { x: f64(v * n.rand[i2]), y: f64(v * n.rand[i2 | 1]) };
+}
+
+fn warp_simplex<a>(n: (&a Noise), seed: i64, warp_amp: f32, frequency: f32, s: Point, base: Point) -> Point {
+    g2 := noise_tables::os2_g2();
+    x := s.x * f64(frequency);
+    y := s.y * f64(frequency);
+    mut i = floor_i(x);
+    mut j = floor_i(y);
+    xi := f32(x - f64(i));
+    yi := f32(y - f64(j));
+    t := (xi + yi) * g2;
+    x0 := xi - t;
+    y0 := yi - t;
+    i = w32(i * PRIME_X);
+    j = w32(j * PRIME_Y);
+    mut vx = f32(0.0);
+    mut vy = f32(0.0);
+    a := f32(0.5) - x0 * x0 - y0 * y0;
+    if a > f32(0.0) {
+        aaaa := (a * a) * (a * a);
+        g := grad_dual(&n, seed, i, j, x0, y0);
+        vx = vx + aaaa * f32(g.x);
+        vy = vy + aaaa * f32(g.y);
+    }
+    c := noise_tables::os2_c1() * t + (noise_tables::os2_c2() + a);
+    if c > f32(0.0) {
+        x2 := x0 + noise_tables::os2_x2();
+        y2 := y0 + noise_tables::os2_x2();
+        cccc := (c * c) * (c * c);
+        g := grad_dual(&n, seed, w32(i + PRIME_X), w32(j + PRIME_Y), x2, y2);
+        vx = vx + cccc * f32(g.x);
+        vy = vy + cccc * f32(g.y);
+    }
+    if y0 > x0 {
+        x1 := x0 + g2;
+        y1 := y0 + noise_tables::os2_g2m1();
+        b := f32(0.5) - x1 * x1 - y1 * y1;
+        if b > f32(0.0) {
+            bbbb := (b * b) * (b * b);
+            g := grad_dual(&n, seed, i, w32(j + PRIME_Y), x1, y1);
+            vx = vx + bbbb * f32(g.x);
+            vy = vy + bbbb * f32(g.y);
+        }
+    } else {
+        x1 := x0 + noise_tables::os2_g2m1();
+        y1 := y0 + g2;
+        b := f32(0.5) - x1 * x1 - y1 * y1;
+        if b > f32(0.0) {
+            bbbb := (b * b) * (b * b);
+            g := grad_dual(&n, seed, w32(i + PRIME_X), j, x1, y1);
+            vx = vx + bbbb * f32(g.x);
+            vy = vy + bbbb * f32(g.y);
+        }
+    }
+    return Point { x: base.x + f64(vx * warp_amp), y: base.y + f64(vy * warp_amp) };
+}
+
+// ---- 3D OpenSimplex2S ----
+pub struct Point3 {
+    x: f64,
+    y: f64,
+    z: f64
+}
+
+fn hash3(seed: i64, xp: i64, yp: i64, zp: i64) -> i64 {
+    return w32((seed ^ xp ^ yp ^ zp) * 668265261);
+}
+fn grad3<a>(n: (&a Noise), seed: i64, p: Point3i, d: Point3f) -> f32 {
+    mut h = hash3(seed, p.x, p.y, p.z);
+    h = h ^ (h >> 15);
+    index := u64(h & 252);
+    return d.x * n.grad3[index] + d.y * n.grad3[index | 1] + d.z * n.grad3[index | 2];
+}
+// Lattice point (primed) and an offset vector: grouped so kernels stay within six parameters.
+struct Point3i {
+    x: i64,
+    y: i64,
+    z: i64
+}
+struct Point3f {
+    x: f32,
+    y: f32,
+    z: f32
+}
+fn term3<a>(n: (&a Noise), seed: i64, a: f32, p: Point3i, d: Point3f) -> f32 {
+    return (a * a) * (a * a) * grad3(&n, seed, p, d);
+}
+// int -> float, as C converts an int operand in float arithmetic.
+fn fi(v: i64) -> f32 {
+    return f32(f64(v));
+}
+fn not32(v: i64) -> i64 {
+    return -1 - v;
+}
+
+// 3D noise at (x, y, z): frequency, the default OpenSimplex2 rotation, then the fractal.
+pub fn get3<a>(n: (&a Noise), p: Point3) -> f32 {
+    mut x = p.x * f64(n.frequency);
+    mut y = p.y * f64(n.frequency);
+    mut z = p.z * f64(n.frequency);
+    if (n.noise_type == NOISE_OPENSIMPLEX2) || (n.noise_type == NOISE_OPENSIMPLEX2S) {
+        r := (x + y + z) * (2.0 / 3.0);
+        x = r - x;
+        y = r - y;
+        z = r - z;
+    }
+    q := Point3 { x: x, y: y, z: z };
+    if n.fractal_type == FRACTAL_FBM {
+        return fbm3(&n, q);
+    }
+    return single3(&n, n.seed, q);
+}
+
+fn single3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
+    if n.noise_type == NOISE_OPENSIMPLEX2S {
+        return simplex_s3(&n, seed, p);
+    }
+    return f32(0.0);
+}
+
+fn fbm3<a>(n: (&a Noise), p_in: Point3) -> f32 {
+    mut x = p_in.x;
+    mut y = p_in.y;
+    mut z = p_in.z;
+    mut seed = n.seed;
+    mut sum = f32(0.0);
+    mut amp = n.bounding;
+    for i in n.octaves {
+        v := single3(&n, seed, Point3 { x: x, y: y, z: z });
+        seed = w32(seed + 1);
+        sum = sum + v * amp;
+        amp = amp * lerp(f32(1.0), (v + f32(1.0)) * f32(0.5), n.weighted_strength);
+        l := f64(n.lacunarity);
+        x = x * l;
+        y = y * l;
+        z = z * l;
+        amp = amp * n.gain;
+    }
+    return sum;
+}
+
+fn simplex_s3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
+    mut i = floor_i(p.x);
+    mut j = floor_i(p.y);
+    mut k = floor_i(p.z);
+    xi := f32(p.x - f64(i));
+    yi := f32(p.y - f64(j));
+    zi := f32(p.z - f64(k));
+    i = w32(i * PRIME_X);
+    j = w32(j * PRIME_Y);
+    k = w32(k * PRIME_Z);
+    seed2 := w32(seed + 1293373);
+    xm := i64(f64(f32(-0.5) - xi));
+    ym := i64(f64(f32(-0.5) - yi));
+    zm := i64(f64(f32(-0.5) - zi));
+    x0 := xi + fi(xm);
+    y0 := yi + fi(ym);
+    z0 := zi + fi(zm);
+    q := f32(0.75);
+    a0 := q - x0 * x0 - y0 * y0 - z0 * z0;
+    px2 := w32(PRIME_X * 2);
+    py2 := w32(PRIME_Y << 1);
+    pz2 := w32(PRIME_Z << 1);
+    mut value = term3(&n, seed, a0,
+        Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
+        Point3f { x: x0, y: y0, z: z0 });
+    x1 := xi - f32(0.5);
+    y1 := yi - f32(0.5);
+    z1 := zi - f32(0.5);
+    a1 := q - x1 * x1 - y1 * y1 - z1 * z1;
+    value = value + term3(&n, seed2, a1,
+        Point3i { x: w32(i + PRIME_X), y: w32(j + PRIME_Y), z: w32(k + PRIME_Z) },
+        Point3f { x: x1, y: y1, z: z1 });
+    xf0 := fi((xm | 1) << 1) * x1;
+    yf0 := fi((ym | 1) << 1) * y1;
+    zf0 := fi((zm | 1) << 1) * z1;
+    xf1 := fi(-2 - (xm << 2)) * x1 - f32(1.0);
+    yf1 := fi(-2 - (ym << 2)) * y1 - f32(1.0);
+    zf1 := fi(-2 - (zm << 2)) * z1 - f32(1.0);
+    xs := fi(xm | 1);
+    ys := fi(ym | 1);
+    zs := fi(zm | 1);
+    mut skip5 = false;
+    a2 := xf0 + a0;
+    if a2 > f32(0.0) {
+        value = value + term3(&n, seed, a2,
+            Point3i { x: w32(i + (not32(xm) & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
+            Point3f { x: x0 - xs, y: y0, z: z0 });
+    } else {
+        a3 := yf0 + zf0 + a0;
+        if a3 > f32(0.0) {
+            value = value + term3(&n, seed, a3,
+                Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (not32(ym) & PRIME_Y)), z: w32(k + (not32(zm) & PRIME_Z)) },
+                Point3f { x: x0, y: y0 - ys, z: z0 - zs });
+        }
+        a4 := xf1 + a1;
+        if a4 > f32(0.0) {
+            value = value + term3(&n, seed2, a4,
+                Point3i { x: w32(i + (xm & px2)), y: w32(j + PRIME_Y), z: w32(k + PRIME_Z) },
+                Point3f { x: xs + x1, y: y1, z: z1 });
+            skip5 = true;
+        }
+    }
+    mut skip9 = false;
+    a6 := yf0 + a0;
+    if a6 > f32(0.0) {
+        value = value + term3(&n, seed, a6,
+            Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (not32(ym) & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
+            Point3f { x: x0, y: y0 - ys, z: z0 });
+    } else {
+        a7 := xf0 + zf0 + a0;
+        if a7 > f32(0.0) {
+            value = value + term3(&n, seed, a7,
+                Point3i { x: w32(i + (not32(xm) & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (not32(zm) & PRIME_Z)) },
+                Point3f { x: x0 - xs, y: y0, z: z0 - zs });
+        }
+        a8 := yf1 + a1;
+        if a8 > f32(0.0) {
+            value = value + term3(&n, seed2, a8,
+                Point3i { x: w32(i + PRIME_X), y: w32(j + (ym & py2)), z: w32(k + PRIME_Z) },
+                Point3f { x: x1, y: ys + y1, z: z1 });
+            skip9 = true;
+        }
+    }
+    mut skip_d = false;
+    a_a := zf0 + a0;
+    if a_a > f32(0.0) {
+        value = value + term3(&n, seed, a_a,
+            Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (not32(zm) & PRIME_Z)) },
+            Point3f { x: x0, y: y0, z: z0 - zs });
+    } else {
+        a_b := xf0 + yf0 + a0;
+        if a_b > f32(0.0) {
+            value = value + term3(&n, seed, a_b,
+                Point3i { x: w32(i + (not32(xm) & PRIME_X)), y: w32(j + (not32(ym) & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
+                Point3f { x: x0 - xs, y: y0 - ys, z: z0 });
+        }
+        a_c := zf1 + a1;
+        if a_c > f32(0.0) {
+            value = value + term3(&n, seed2, a_c,
+                Point3i { x: w32(i + PRIME_X), y: w32(j + PRIME_Y), z: w32(k + (zm & pz2)) },
+                Point3f { x: x1, y: y1, z: zs + z1 });
+            skip_d = true;
+        }
+    }
+    if skip5 == false {
+        a5 := yf1 + zf1 + a1;
+        if a5 > f32(0.0) {
+            value = value + term3(&n, seed2, a5,
+                Point3i { x: w32(i + PRIME_X), y: w32(j + (ym & py2)), z: w32(k + (zm & pz2)) },
+                Point3f { x: x1, y: ys + y1, z: zs + z1 });
+        }
+    }
+    if skip9 == false {
+        a9 := xf1 + zf1 + a1;
+        if a9 > f32(0.0) {
+            value = value + term3(&n, seed2, a9,
+                Point3i { x: w32(i + (xm & px2)), y: w32(j + PRIME_Y), z: w32(k + (zm & pz2)) },
+                Point3f { x: xs + x1, y: y1, z: zs + z1 });
+        }
+    }
+    if skip_d == false {
+        a_d := xf1 + yf1 + a1;
+        if a_d > f32(0.0) {
+            value = value + term3(&n, seed2, a_d,
+                Point3i { x: w32(i + (xm & w32(PRIME_X << 1))), y: w32(j + (ym & py2)), z: w32(k + PRIME_Z) },
+                Point3f { x: xs + x1, y: ys + y1, z: z1 });
+        }
+    }
+    return value * noise_tables::os2s3_scale();
+}
