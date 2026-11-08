@@ -67,7 +67,7 @@ int main() {
     std::printf("    exp := ((b >> 52) & 2047) + 127 - 1023;\n    mant := (b >> 29) & 8388607;\n    return sign * 2147483648 + exp * 8388608 + mant;\n}\n\n");
     std::printf("fn coords() -> f64[] {\n    return f64[");
     for (int i = 0; i < points; ++i) std::printf("%s%.17g, %.17g", i ? ", " : "", xs[i], ys[i]);
-    std::printf("];\n}\n\nfn main() {\n    c := coords();\n");
+    std::printf("];\n}\n\n// Returns the number of samples that differ from the C++ bits.\nfn main() -> u64 {\n    c := coords();\n    mut total: u64 = 0;\n");
     for (int k = 0; k < count; ++k) {
         Config &cfg = cases[k];
         std::printf("    {\n        mut n = noise::new(1337);\n        %s\n", cfg.setup);
@@ -78,16 +78,16 @@ int main() {
                 cfg.noise.DomainWarp(x, y);
                 std::printf("%s%llu, %llu", i ? ", " : "", (unsigned long long)bits64(x), (unsigned long long)bits64(y));
             }
-            std::printf("];\n        mut bad = 0;\n        for i in %d {\n", points);
+            std::printf("];\n        mut bad: u64 = 0;\n        for i in %d {\n", points);
             std::printf("            p := noise::warp(&n, noise::Point { x: c[2 * i], y: c[2 * i + 1] });\n");
             std::printf("            if (bits(p.x) != want[2 * i]) || (bits(p.y) != want[2 * i + 1]) {\n                bad += 1;\n            }\n        }\n");
         } else {
             std::printf("        want := u64[");
             for (int i = 0; i < points; ++i) std::printf("%s%u", i ? ", " : "", bits(cfg.noise.GetNoise(xs[i], ys[i])));
-            std::printf("];\n        mut bad = 0;\n        for i in %d {\n", points);
+            std::printf("];\n        mut bad: u64 = 0;\n        for i in %d {\n", points);
             std::printf("            if f32_bits(noise::get(&n, c[2 * i], c[2 * i + 1])) != want[i] {\n                bad += 1;\n            }\n        }\n");
         }
-        std::printf("        println(\"%s: {} of %d differ\", bad);\n    }\n", cfg.name, points);
+        std::printf("        println(\"%s: {} of %d differ\", bad);\n        total += bad;\n    }\n", cfg.name, points);
     }
     struct { const char *name, *setup; FastNoiseLite *n; } three[] = {
         {"os2s_3d", "noise::set_noise_type(&mut n, noise::NOISE_OPENSIMPLEX2S);", &r1},
@@ -100,11 +100,11 @@ int main() {
             double z = -73.5 + i * 3.125;
             std::printf("%s%u", i ? ", " : "", bits(t.n->GetNoise(xs[i], ys[i], z)));
         }
-        std::printf("];\n        mut bad = 0;\n        for i in %d {\n", points);
+        std::printf("];\n        mut bad: u64 = 0;\n        for i in %d {\n", points);
         std::printf("            z := -73.5 + f64(i) * 3.125;\n");
         std::printf("            if f32_bits(noise::get3(&n, noise::Point3 { x: c[2 * i], y: c[2 * i + 1], z: z })) != want[i] {\n                bad += 1;\n            }\n        }\n");
-        std::printf("        println(\"%s: {} of %d differ\", bad);\n    }\n", t.name, points);
+        std::printf("        println(\"%s: {} of %d differ\", bad);\n        total += bad;\n    }\n", t.name, points);
     }
-    std::printf("}\n");
+    std::printf("    return total;\n}\n");
     return 0;
 }

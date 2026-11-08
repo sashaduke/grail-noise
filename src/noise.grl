@@ -134,7 +134,7 @@ fn bound<a>(n: (&a mut Noise)) {
     gain := fabs(n.gain);
     mut amp = gain;
     mut fractal = f32(1.0);
-    mut i = 1;
+    mut i: u64 = 1;
     while i < n.octaves {
         fractal = fractal + amp;
         amp = amp * gain;
@@ -467,7 +467,7 @@ pub fn warp<a>(n: (&a Noise), p: Point) -> Point {
     mut seed = n.seed;
     mut amp = n.warp_amp * n.bounding;
     mut freq = n.frequency;
-    mut rounds = 1;
+    mut rounds: u64 = 1;
     if n.fractal_type == FRACTAL_WARP_PROGRESSIVE {
         rounds = n.octaves;
     }
