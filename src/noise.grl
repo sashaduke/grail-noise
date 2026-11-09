@@ -557,25 +557,15 @@ pub struct Point3 {
 fn hash3(seed: i64, xp: i64, yp: i64, zp: i64) -> i64 {
     return w32((seed ^ xp ^ yp ^ zp) * 668265261);
 }
-fn grad3<a>(n: (&a Noise), seed: i64, p: Point3i, d: Point3f) -> f32 {
-    mut h = hash3(seed, p.x, p.y, p.z);
+// GradCoord: the gradient at a primed lattice point dotted with the offset (xd, yd, zd).
+fn grad3<a>(n: (&a Noise), seed: i64, xp: i64, yp: i64, zp: i64, xd: f32, yd: f32, zd: f32) -> f32 {
+    mut h = hash3(seed, xp, yp, zp);
     h = h ^ (h >> 15);
     index := u64(h & 252);
-    return d.x * n.grad3[index] + d.y * n.grad3[index | 1] + d.z * n.grad3[index | 2];
+    return xd * n.grad3[index] + yd * n.grad3[index | 1] + zd * n.grad3[index | 2];
 }
-// Lattice point (primed) and an offset vector: grouped so kernels stay within six parameters.
-struct Point3i {
-    x: i64,
-    y: i64,
-    z: i64
-}
-struct Point3f {
-    x: f32,
-    y: f32,
-    z: f32
-}
-fn term3<a>(n: (&a Noise), seed: i64, a: f32, p: Point3i, d: Point3f) -> f32 {
-    return (a * a) * (a * a) * grad3(&n, seed, p, d);
+fn term3<a>(n: (&a Noise), seed: i64, a: f32, xp: i64, yp: i64, zp: i64, xd: f32, yd: f32, zd: f32) -> f32 {
+    return (a * a) * (a * a) * grad3(&n, seed, xp, yp, zp, xd, yd, zd);
 }
 // int -> float, as C converts an int operand in float arithmetic.
 fn fi(v: i64) -> f32 {
@@ -654,15 +644,15 @@ fn simplex_s3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
     py2 := w32(PRIME_Y << 1);
     pz2 := w32(PRIME_Z << 1);
     mut value = term3(&n, seed, a0,
-        Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
-        Point3f { x: x0, y: y0, z: z0 });
+        w32(i + (xm & PRIME_X)), w32(j + (ym & PRIME_Y)), w32(k + (zm & PRIME_Z)),
+        x0, y0, z0);
     x1 := xi - f32(0.5);
     y1 := yi - f32(0.5);
     z1 := zi - f32(0.5);
     a1 := q - x1 * x1 - y1 * y1 - z1 * z1;
     value = value + term3(&n, seed2, a1,
-        Point3i { x: w32(i + PRIME_X), y: w32(j + PRIME_Y), z: w32(k + PRIME_Z) },
-        Point3f { x: x1, y: y1, z: z1 });
+        w32(i + PRIME_X), w32(j + PRIME_Y), w32(k + PRIME_Z),
+        x1, y1, z1);
     xf0 := fi((xm | 1) << 1) * x1;
     yf0 := fi((ym | 1) << 1) * y1;
     zf0 := fi((zm | 1) << 1) * z1;
@@ -676,20 +666,20 @@ fn simplex_s3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
     a2 := xf0 + a0;
     if a2 > f32(0.0) {
         value = value + term3(&n, seed, a2,
-            Point3i { x: w32(i + (not32(xm) & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
-            Point3f { x: x0 - xs, y: y0, z: z0 });
+            w32(i + (not32(xm) & PRIME_X)), w32(j + (ym & PRIME_Y)), w32(k + (zm & PRIME_Z)),
+            x0 - xs, y0, z0);
     } else {
         a3 := yf0 + zf0 + a0;
         if a3 > f32(0.0) {
             value = value + term3(&n, seed, a3,
-                Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (not32(ym) & PRIME_Y)), z: w32(k + (not32(zm) & PRIME_Z)) },
-                Point3f { x: x0, y: y0 - ys, z: z0 - zs });
+                w32(i + (xm & PRIME_X)), w32(j + (not32(ym) & PRIME_Y)), w32(k + (not32(zm) & PRIME_Z)),
+                x0, y0 - ys, z0 - zs);
         }
         a4 := xf1 + a1;
         if a4 > f32(0.0) {
             value = value + term3(&n, seed2, a4,
-                Point3i { x: w32(i + (xm & px2)), y: w32(j + PRIME_Y), z: w32(k + PRIME_Z) },
-                Point3f { x: xs + x1, y: y1, z: z1 });
+                w32(i + (xm & px2)), w32(j + PRIME_Y), w32(k + PRIME_Z),
+                xs + x1, y1, z1);
             skip5 = true;
         }
     }
@@ -697,20 +687,20 @@ fn simplex_s3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
     a6 := yf0 + a0;
     if a6 > f32(0.0) {
         value = value + term3(&n, seed, a6,
-            Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (not32(ym) & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
-            Point3f { x: x0, y: y0 - ys, z: z0 });
+            w32(i + (xm & PRIME_X)), w32(j + (not32(ym) & PRIME_Y)), w32(k + (zm & PRIME_Z)),
+            x0, y0 - ys, z0);
     } else {
         a7 := xf0 + zf0 + a0;
         if a7 > f32(0.0) {
             value = value + term3(&n, seed, a7,
-                Point3i { x: w32(i + (not32(xm) & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (not32(zm) & PRIME_Z)) },
-                Point3f { x: x0 - xs, y: y0, z: z0 - zs });
+                w32(i + (not32(xm) & PRIME_X)), w32(j + (ym & PRIME_Y)), w32(k + (not32(zm) & PRIME_Z)),
+                x0 - xs, y0, z0 - zs);
         }
         a8 := yf1 + a1;
         if a8 > f32(0.0) {
             value = value + term3(&n, seed2, a8,
-                Point3i { x: w32(i + PRIME_X), y: w32(j + (ym & py2)), z: w32(k + PRIME_Z) },
-                Point3f { x: x1, y: ys + y1, z: z1 });
+                w32(i + PRIME_X), w32(j + (ym & py2)), w32(k + PRIME_Z),
+                x1, ys + y1, z1);
             skip9 = true;
         }
     }
@@ -718,20 +708,20 @@ fn simplex_s3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
     a_a := zf0 + a0;
     if a_a > f32(0.0) {
         value = value + term3(&n, seed, a_a,
-            Point3i { x: w32(i + (xm & PRIME_X)), y: w32(j + (ym & PRIME_Y)), z: w32(k + (not32(zm) & PRIME_Z)) },
-            Point3f { x: x0, y: y0, z: z0 - zs });
+            w32(i + (xm & PRIME_X)), w32(j + (ym & PRIME_Y)), w32(k + (not32(zm) & PRIME_Z)),
+            x0, y0, z0 - zs);
     } else {
         a_b := xf0 + yf0 + a0;
         if a_b > f32(0.0) {
             value = value + term3(&n, seed, a_b,
-                Point3i { x: w32(i + (not32(xm) & PRIME_X)), y: w32(j + (not32(ym) & PRIME_Y)), z: w32(k + (zm & PRIME_Z)) },
-                Point3f { x: x0 - xs, y: y0 - ys, z: z0 });
+                w32(i + (not32(xm) & PRIME_X)), w32(j + (not32(ym) & PRIME_Y)), w32(k + (zm & PRIME_Z)),
+                x0 - xs, y0 - ys, z0);
         }
         a_c := zf1 + a1;
         if a_c > f32(0.0) {
             value = value + term3(&n, seed2, a_c,
-                Point3i { x: w32(i + PRIME_X), y: w32(j + PRIME_Y), z: w32(k + (zm & pz2)) },
-                Point3f { x: x1, y: y1, z: zs + z1 });
+                w32(i + PRIME_X), w32(j + PRIME_Y), w32(k + (zm & pz2)),
+                x1, y1, zs + z1);
             skip_d = true;
         }
     }
@@ -739,24 +729,24 @@ fn simplex_s3<a>(n: (&a Noise), seed: i64, p: Point3) -> f32 {
         a5 := yf1 + zf1 + a1;
         if a5 > f32(0.0) {
             value = value + term3(&n, seed2, a5,
-                Point3i { x: w32(i + PRIME_X), y: w32(j + (ym & py2)), z: w32(k + (zm & pz2)) },
-                Point3f { x: x1, y: ys + y1, z: zs + z1 });
+                w32(i + PRIME_X), w32(j + (ym & py2)), w32(k + (zm & pz2)),
+                x1, ys + y1, zs + z1);
         }
     }
     if skip9 == false {
         a9 := xf1 + zf1 + a1;
         if a9 > f32(0.0) {
             value = value + term3(&n, seed2, a9,
-                Point3i { x: w32(i + (xm & px2)), y: w32(j + PRIME_Y), z: w32(k + (zm & pz2)) },
-                Point3f { x: xs + x1, y: y1, z: zs + z1 });
+                w32(i + (xm & px2)), w32(j + PRIME_Y), w32(k + (zm & pz2)),
+                xs + x1, y1, zs + z1);
         }
     }
     if skip_d == false {
         a_d := xf1 + yf1 + a1;
         if a_d > f32(0.0) {
             value = value + term3(&n, seed2, a_d,
-                Point3i { x: w32(i + (xm & w32(PRIME_X << 1))), y: w32(j + (ym & py2)), z: w32(k + PRIME_Z) },
-                Point3f { x: xs + x1, y: ys + y1, z: z1 });
+                w32(i + (xm & w32(PRIME_X << 1))), w32(j + (ym & py2)), w32(k + PRIME_Z),
+                xs + x1, ys + y1, z1);
         }
     }
     return value * noise_tables::os2s3_scale();
